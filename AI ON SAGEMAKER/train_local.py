@@ -793,7 +793,568 @@ Run on laptop:
 
 
 
-    
+
+
+"""
+train_local.py — per-station-type models
+=============================================
+CHANGED FROM THE ORIGINAL: stations no longer share one uniform sensor set.
+Station 1/3 report vibration_1/2 + moisture_1/2 (4 features). Station 2
+reports temperature_1/2/3 + pressure_1/2 + ultrasonic (6 features). Those
+can't be one model, so this trains TWO Isolation Forests — one per
+station-type — and packages both into the same model.tar.gz. The SageMaker
+ENDPOINT name and deploy/delete scripts are UNCHANGED; only what's inside
+the tar.gz differs. inference.py picks the right model per request.
+
+ALSO CHANGED: synthetic "normal" and "fault" ranges are no longer hardcoded
+numbers — they're DERIVED from the LIVE sensor-thresholds DynamoDB table
+(same table, same merge logic as ai_inference.py/send_alert.py), fetched
+once via load_representative_thresholds(). This was a real, recurring
+problem before: hardcoded ranges drifted out of sync every time a real
+threshold got tuned (this happened at least three times across pressure's
+Pa/kPa scale, ultrasonic's mm scale, and ultrasonic's swapped warn/crit
+values), each requiring a manual fix here. Deriving from the live table
+means a future threshold change just works, next time this is run.
+
+  - "Normal" band = [low_warn or 0, warn] — matches what check_threshold()
+    itself considers non-alerting.
+  - "Fault" (high-side) = pushed past crit, scaled by the tag's own
+    warn-to-crit gap (so this works sensibly whether that gap is ~3 for
+    vibration or ~1500 for pressure_1).
+  - "Fault" (low-side, only for tags with low_crit) = pushed past low_crit,
+    scaled the same way.
+  - If a tag's live threshold is missing entirely (table not reachable,
+    or that specific tag was never saved), each call falls back to a
+    hardcoded default — training still works, just back to the old
+    guessed ranges for that one tag.
+
+Uses factory1 as the representative station for the vibration_moisture
+model and factory2 for thermal_pressure — factory3 shares factory1's
+tag set but the model itself is generic per station-TYPE, not per specific
+factory, so one representative factory per type is what's needed here.
+
+Run on laptop:
+  pip install scikit-learn joblib boto3 numpy pandas
+  python train_local.py
+"""
+
+# import numpy as np
+# import pandas as pd
+# import boto3
+# import joblib
+# import os
+# import tarfile
+# from decimal import Decimal
+# from sklearn.ensemble import IsolationForest
+# from sklearn.preprocessing import StandardScaler
+
+# AWS_REGION      = "ap-southeast-2"
+# S3_BUCKET       = "factory-ai-data-capstone"     # update this
+# THRESH_TABLE    = "sensor-thresholds"
+# REP_FACTORY_VM  = "factory1"   # representative station for vibration_moisture
+# REP_FACTORY_TP  = "factory2"   # representative station for thermal_pressure
+
+# FEATURES_BY_MODEL = {
+#     "vibration_moisture": ["vibration_1", "vibration_2", "moisture_1", "moisture_2"],
+#     "thermal_pressure":   ["temperature_1", "temperature_2", "temperature_3", "pressure_1", "pressure_2", "ultrasonic"],
+# }
+
+# np.random.seed(42)
+
+
+# # ── Live threshold loading (mirrors ai_inference.py's load_thresholds) ────────
+# def _to_float(val):
+#     return float(val) if isinstance(val, Decimal) else val
+
+
+# def load_representative_thresholds(factory):
+#     """Fetches thresholds scoped to ONE factory from the live table — same
+#     merge logic as ai_inference.py/send_alert.py: a factory-specific
+#     override (tag == "factoryN#sensor") wins over a legacy un-prefixed row.
+#     Returns {} on any failure so callers cleanly fall back to hardcoded
+#     defaults rather than crashing training."""
+#     try:
+#         dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+#         table = dynamodb.Table(THRESH_TABLE)
+#         result = table.scan()
+#     except Exception as e:
+#         print(f"    Could not load live thresholds ({e}) — using hardcoded fallback ranges")
+#         return {}
+
+#     legacy = {}
+#     scoped = {}
+#     prefix = f"{factory}#"
+#     for item in result.get("Items", []):
+#         raw_tag = item.get("tag")
+#         if not raw_tag:
+#             continue
+#         row = {
+#             "warn":     _to_float(item["warn"])     if "warn"     in item else None,
+#             "crit":     _to_float(item["crit"])     if "crit"     in item else None,
+#             "low_warn": _to_float(item["low_warn"]) if "low_warn" in item else None,
+#             "low_crit": _to_float(item["low_crit"]) if "low_crit" in item else None,
+#         }
+#         if raw_tag.startswith(prefix):
+#             scoped[raw_tag[len(prefix):]] = row
+#         elif "#" not in raw_tag:
+#             legacy[raw_tag] = row
+#     merged = {**legacy, **scoped}
+#     print(f"    Loaded live thresholds for {factory}: {list(merged.keys())}")
+#     return merged
+
+
+# # ── Range derivation helpers ───────────────────────────────────────────────
+# def normal_range(tag, th, fallback):
+#     """(mean, std, clip_lo, clip_hi) for the NORMAL band: [low_warn or 0, warn].
+#     fallback = (mean, std, clip_lo, clip_hi) used if this tag's warn is missing."""
+#     t = th.get(tag) or {}
+#     warn = t.get("warn")
+#     if warn is None:
+#         return fallback
+#     lo = t.get("low_warn")
+#     lo = lo if lo is not None else 0
+#     hi = warn
+#     mean = (lo + hi) / 2
+#     std = max((hi - lo) / 6, 1e-9)  # ~3-sigma keeps ~99.7% inside the band
+#     return mean, std, lo, hi
+
+
+# def fault_high_range(tag, th, fallback):
+#     """(mean, std, clip_lo, clip_hi) pushed PAST crit — for a fault where
+#     this tag reads too HIGH. Scaled by this tag's own warn-to-crit gap."""
+#     t = th.get(tag) or {}
+#     crit, warn = t.get("crit"), t.get("warn")
+#     if crit is None or warn is None:
+#         return fallback
+#     gap = crit - warn
+#     mean = crit + gap * 0.5
+#     std = max(gap / 3, 1e-9)
+#     return mean, std, warn, crit + gap * 2
+
+
+# def fault_low_range(tag, th, fallback):
+#     """(mean, std, clip_lo, clip_hi) pushed PAST low_crit — for a fault
+#     where this tag reads too LOW. Only meaningful for tags that HAVE a
+#     low_crit (e.g. ultrasonic); returns fallback if this tag doesn't."""
+#     t = th.get(tag) or {}
+#     low_crit, low_warn = t.get("low_crit"), t.get("low_warn")
+#     if low_crit is None or low_warn is None:
+#         return fallback
+#     gap = low_warn - low_crit
+#     mean = low_crit - gap * 0.5
+#     std = max(gap / 3, 1e-9)
+#     return mean, std, max(0, low_crit - gap * 2), low_warn
+
+
+# def gen(mean, std, lo, hi, n):
+#     return np.random.normal(mean, std, n).clip(lo, hi)
+
+
+# def filter_real_normal_rows(df, ranges_by_tag):
+#     """Removes rows from REAL data that are genuine HIGH-side fault events
+#     (a tag above its own warn), so they don't get trained into the model
+#     as if they were normal operation. Deliberately does NOT filter on the
+#     low side — verified against real data that low/near-zero readings are
+#     overwhelmingly legitimate idle states (machine off), not genuine
+#     "too low" faults; filtering those out too was tried and discarded
+#     after it wrongly excluded ~50% of real rows as "fault" when they were
+#     actually just idle periods.
+#     ranges_by_tag: {tag_name: (mean, std, lo, hi)} — only hi is used here."""
+#     mask = pd.Series(True, index=df.index)
+#     dropped_by_tag = {}
+#     for tag, (_, _, _, hi) in ranges_by_tag.items():
+#         if tag not in df.columns:
+#             continue
+#         tag_mask = df[tag] <= hi
+#         dropped_by_tag[tag] = int((~tag_mask).sum())
+#         mask &= tag_mask
+#     filtered = df[mask].reset_index(drop=True)
+#     n_dropped = len(df) - len(filtered)
+#     if n_dropped > 0:
+#         print(f"    Dropped {n_dropped} real rows containing a genuine HIGH-side fault "
+#               f"reading from the 'normal' training set — per-tag breach counts: {dropped_by_tag}")
+#     return filtered
+
+
+# # ── Model 1: vibration_moisture (Stations 1 & 3) ────────────────────────────
+# def build_vibration_moisture_dataset():
+#     n_fault = 120  # split across 4 fault scenarios, 30 each
+#     k = n_fault // 4
+
+#     th = load_representative_thresholds(REP_FACTORY_VM)
+
+#     # (mean, std, clip_lo, clip_hi) — used only if the live threshold for
+#     # that tag is missing entirely.
+#     FB_NORMAL = {
+#         "vibration_1": (3.5, 1.17, 0, 7), "vibration_2": (3.5, 1.17, 0, 7),
+#         "moisture_1":  (9, 3, 0, 18),     "moisture_2":  (9, 3, 0, 18),
+#     }
+#     n_vib1 = normal_range("vibration_1", th, FB_NORMAL["vibration_1"])
+#     n_vib2 = normal_range("vibration_2", th, FB_NORMAL["vibration_2"])
+#     n_moi1 = normal_range("moisture_1",  th, FB_NORMAL["moisture_1"])
+#     n_moi2 = normal_range("moisture_2",  th, FB_NORMAL["moisture_2"])
+
+#     real_path = "real_data_vibration_moisture.csv"
+#     if os.path.exists(real_path):
+#         raw = pd.read_csv(real_path)
+#         normal = filter_real_normal_rows(raw, {
+#             "vibration_1": n_vib1, "vibration_2": n_vib2,
+#             "moisture_1": n_moi1, "moisture_2": n_moi2,
+#         })
+#         n_normal = len(normal)
+#         print(f"    Using {n_normal} REAL rows from {real_path} as normal data "
+#               f"({len(raw) - n_normal} of {len(raw)} excluded as genuine faults)")
+#     else:
+#         n_normal = 2000
+#         # 40% of "normal" samples are IDLE (machine off) rather than
+#         # actively operating — otherwise the model only ever learns
+#         # "operating" as normal and flags idle readings (near-zero
+#         # vibration) as anomalous, even though idle is a completely
+#         # legitimate, expected state, not a fault. Moisture is a property
+#         # of the material sitting there, not the motor running, so it
+#         # keeps the same range in both states — only vibration goes
+#         # near-zero when idle.
+#         n_idle = int(n_normal * 0.4)
+#         n_operating = n_normal - n_idle
+#         IDLE_VIB = (0.05, 0.03, 0, 0.5)  # near-zero when the machine is off
+
+#         operating = pd.DataFrame({
+#             "vibration_1": gen(*n_vib1, n_operating),
+#             "vibration_2": gen(*n_vib2, n_operating),
+#             "moisture_1":  gen(*n_moi1, n_operating),
+#             "moisture_2":  gen(*n_moi2, n_operating),
+#         })
+#         idle = pd.DataFrame({
+#             "vibration_1": gen(*IDLE_VIB, n_idle),
+#             "vibration_2": gen(*IDLE_VIB, n_idle),
+#             "moisture_1":  gen(*n_moi1, n_idle),
+#             "moisture_2":  gen(*n_moi2, n_idle),
+#         })
+#         normal = pd.concat([operating, idle], ignore_index=True)
+#         print(f"    No {real_path} found — using {n_normal} SYNTHETIC normal rows "
+#               f"({n_operating} operating + {n_idle} idle/machine-off), ranges derived "
+#               f"from live thresholds (run fetch_real_data.py first to train on real "
+#               f"history instead)")
+
+#     FB_FAULT_HIGH = {
+#         "vibration_1": (9, 1.0, 7, 12), "vibration_2": (9, 1.0, 7, 12),
+#         "moisture_1":  (25, 2, 22, 30), "moisture_2":  (25, 2, 22, 30),
+#     }
+#     f_vib1 = fault_high_range("vibration_1", th, FB_FAULT_HIGH["vibration_1"])
+#     f_vib2 = fault_high_range("vibration_2", th, FB_FAULT_HIGH["vibration_2"])
+#     f_moi1 = fault_high_range("moisture_1",  th, FB_FAULT_HIGH["moisture_1"])
+#     f_moi2 = fault_high_range("moisture_2",  th, FB_FAULT_HIGH["moisture_2"])
+
+#     # Fault A: both vibration sensors elevated — general bearing/mounting wear
+#     fault_vib_both = pd.DataFrame({
+#         "vibration_1": gen(*f_vib1, k), "vibration_2": gen(*f_vib2, k),
+#         "moisture_1":  gen(*n_moi1, k), "moisture_2":  gen(*n_moi2, k),
+#     })
+
+#     # Fault B: ONE vibration sensor elevated, the other normal — localized
+#     # mechanical issue. This is exactly the kind of fault having two
+#     # separate sensors (instead of one) is meant to catch.
+#     fault_vib_one = pd.DataFrame({
+#         "vibration_1": gen(*f_vib1, k), "vibration_2": gen(*n_vib2, k),
+#         "moisture_1":  gen(*n_moi1, k), "moisture_2":  gen(*n_moi2, k),
+#     })
+
+#     # Fault C: both moisture sensors elevated — material quality issue
+#     fault_moist_both = pd.DataFrame({
+#         "vibration_1": gen(*n_vib1, k), "vibration_2": gen(*n_vib2, k),
+#         "moisture_1":  gen(*f_moi1, k), "moisture_2":  gen(*f_moi2, k),
+#     })
+
+#     # Fault D: combined vibration + moisture — severe/compound fault
+#     fault_combined = pd.DataFrame({
+#         "vibration_1": gen(*f_vib1, k), "vibration_2": gen(*f_vib2, k),
+#         "moisture_1":  gen(*f_moi1, k), "moisture_2":  gen(*f_moi2, k),
+#     })
+
+#     df = pd.concat([normal, fault_vib_both, fault_vib_one, fault_moist_both, fault_combined], ignore_index=True)
+#     return df[FEATURES_BY_MODEL["vibration_moisture"]].dropna(), n_normal, n_fault, {
+#         "normal": {"vibration_1": n_vib1, "vibration_2": n_vib2, "moisture_1": n_moi1, "moisture_2": n_moi2},
+#         "fault_high": {"vibration_1": f_vib1, "vibration_2": f_vib2, "moisture_1": f_moi1, "moisture_2": f_moi2},
+#     }
+
+
+# # ── Model 2: thermal_pressure (Station 2) ───────────────────────────────────
+# def build_thermal_pressure_dataset():
+#     n_fault  = 150  # split across 5 fault scenarios, 30 each
+#     k = n_fault // 5
+
+#     th = load_representative_thresholds(REP_FACTORY_TP)
+
+#     FB_NORMAL = {
+#         "temperature_1": (45, 15, 0, 90), "temperature_2": (45, 15, 0, 90), "temperature_3": (45, 15, 0, 90),
+#         "pressure_1": (3750, 1083, 1000, 6500), "pressure_2": (3.75, 1.08, 1.0, 6.5),
+#         "ultrasonic": (565, 28, 480, 650),
+#     }
+#     n_t1 = normal_range("temperature_1", th, FB_NORMAL["temperature_1"])
+#     n_t2 = normal_range("temperature_2", th, FB_NORMAL["temperature_2"])
+#     n_t3 = normal_range("temperature_3", th, FB_NORMAL["temperature_3"])
+#     n_p1 = normal_range("pressure_1",    th, FB_NORMAL["pressure_1"])
+#     n_p2 = normal_range("pressure_2",    th, FB_NORMAL["pressure_2"])
+#     n_us = normal_range("ultrasonic",    th, FB_NORMAL["ultrasonic"])
+
+#     real_path = "real_data_thermal_pressure.csv"
+#     if os.path.exists(real_path):
+#         raw = pd.read_csv(real_path)
+#         normal = filter_real_normal_rows(raw, {
+#             "temperature_1": n_t1, "temperature_2": n_t2, "temperature_3": n_t3,
+#             "pressure_1": n_p1, "pressure_2": n_p2,
+#             # ultrasonic deliberately excluded from filtering AND from the
+#             # real data itself below — see the note after this block
+#         })
+#         # ultrasonic wasn't connected yet when this data was collected, so
+#         # that column is meaningless — replace it with fresh synthetic
+#         # values instead of training on real-looking numbers that don't
+#         # actually reflect the sensor. Everything else in this row IS real.
+#         normal["ultrasonic"] = gen(*n_us, len(normal))
+#         n_normal = len(normal)
+#         print(f"    Using {n_normal} REAL rows from {real_path} as normal data "
+#               f"({len(raw) - n_normal} of {len(raw)} excluded as genuine faults; "
+#               f"ultrasonic column replaced with synthetic — not connected during collection)")
+#     else:
+#         n_normal = 2000
+#         # Same idle/operating mix as vibration_moisture — temperature and
+#         # pressure both drop to near-ambient/near-zero when the machine is
+#         # off, and without teaching the model that explicitly, idle
+#         # readings get flagged as anomalous even though nothing is wrong.
+#         # Ultrasonic (storage level) doesn't depend on the motor running,
+#         # so it keeps the same range in both states.
+#         n_idle = int(n_normal * 0.4)
+#         n_operating = n_normal - n_idle
+#         IDLE_TEMP = (27, 3, 15, 35)   # ambient room temperature
+#         IDLE_P1   = (15, 10, 0, 50)   # near-zero, machine not pressurizing
+#         IDLE_P2   = (0.0, 0.5, -2, 2)  # near-zero, small +/- sensor noise
+
+#         operating = pd.DataFrame({
+#             "temperature_1": gen(*n_t1, n_operating), "temperature_2": gen(*n_t2, n_operating), "temperature_3": gen(*n_t3, n_operating),
+#             "pressure_1":    gen(*n_p1, n_operating), "pressure_2":    gen(*n_p2, n_operating),
+#             "ultrasonic":    gen(*n_us, n_operating),
+#         })
+#         idle = pd.DataFrame({
+#             "temperature_1": gen(*IDLE_TEMP, n_idle), "temperature_2": gen(*IDLE_TEMP, n_idle), "temperature_3": gen(*IDLE_TEMP, n_idle),
+#             "pressure_1":    gen(*IDLE_P1, n_idle),   "pressure_2":    gen(*IDLE_P2, n_idle),
+#             "ultrasonic":    gen(*n_us, n_idle),
+#         })
+#         normal = pd.concat([operating, idle], ignore_index=True)
+#         print(f"    No {real_path} found — using {n_normal} SYNTHETIC normal rows "
+#               f"({n_operating} operating + {n_idle} idle/machine-off), ranges derived "
+#               f"from live thresholds (run fetch_real_data.py first to train on real "
+#               f"history instead)")
+
+#     FB_FAULT_HIGH = {
+#         "temperature_1": (110, 5, 90, 130), "temperature_2": (110, 5, 90, 130), "temperature_3": (110, 5, 90, 130),
+#         "pressure_1": (9000, 500, 8000, 10000), "pressure_2": (9.0, 0.5, 8.0, 10.0),
+#         "ultrasonic": (750, 20, 700, 800),
+#     }
+#     f_t1 = fault_high_range("temperature_1", th, FB_FAULT_HIGH["temperature_1"])
+#     f_t2 = fault_high_range("temperature_2", th, FB_FAULT_HIGH["temperature_2"])
+#     f_t3 = fault_high_range("temperature_3", th, FB_FAULT_HIGH["temperature_3"])
+#     f_p1 = fault_high_range("pressure_1",    th, FB_FAULT_HIGH["pressure_1"])
+#     f_p2 = fault_high_range("pressure_2",    th, FB_FAULT_HIGH["pressure_2"])
+#     f_us_high = fault_high_range("ultrasonic", th, FB_FAULT_HIGH["ultrasonic"])
+#     f_us_low  = fault_low_range("ultrasonic",  th, (225, 100, 0, 440))
+
+#     # Fault A: thermal overload, all 3 sensors elevated together
+#     fault_thermal_all = pd.DataFrame({
+#         "temperature_1": gen(*f_t1, k), "temperature_2": gen(*f_t2, k), "temperature_3": gen(*f_t3, k),
+#         "pressure_1":    gen(*n_p1, k), "pressure_2":    gen(*n_p2, k),
+#         "ultrasonic":    gen(*n_us, k),
+#     })
+
+#     # Fault B: ONE thermal sensor elevated, others normal — localized hotspot
+#     fault_thermal_one = pd.DataFrame({
+#         "temperature_1": gen(*f_t1, k), "temperature_2": gen(*n_t2, k), "temperature_3": gen(*n_t3, k),
+#         "pressure_1":    gen(*n_p1, k), "pressure_2":    gen(*n_p2, k),
+#         "ultrasonic":    gen(*n_us, k),
+#     })
+
+#     # Fault C: pressure spike, both sensors
+#     fault_pressure = pd.DataFrame({
+#         "temperature_1": gen(*n_t1, k), "temperature_2": gen(*n_t2, k), "temperature_3": gen(*n_t3, k),
+#         "pressure_1":    gen(*f_p1, k), "pressure_2":    gen(*f_p2, k),
+#         "ultrasonic":    gen(*n_us, k),
+#     })
+
+#     # Fault D: storage overfull — material too close to the ultrasonic sensor
+#     fault_overfull = pd.DataFrame({
+#         "temperature_1": gen(*n_t1, k), "temperature_2": gen(*n_t2, k), "temperature_3": gen(*n_t3, k),
+#         "pressure_1":    gen(*n_p1, k), "pressure_2":    gen(*n_p2, k),
+#         "ultrasonic":    gen(*f_us_low, k),
+#     })
+
+#     # Fault E: storage running low/empty — material far from the sensor
+#     fault_lowstorage = pd.DataFrame({
+#         "temperature_1": gen(*n_t1, k), "temperature_2": gen(*n_t2, k), "temperature_3": gen(*n_t3, k),
+#         "pressure_1":    gen(*n_p1, k), "pressure_2":    gen(*n_p2, k),
+#         "ultrasonic":    gen(*f_us_high, k),
+#     })
+
+#     df = pd.concat([
+#         normal, fault_thermal_all, fault_thermal_one, fault_pressure, fault_overfull, fault_lowstorage
+#     ], ignore_index=True)
+#     return df[FEATURES_BY_MODEL["thermal_pressure"]].dropna(), n_normal, n_fault, {
+#         "normal": {"temperature_1": n_t1, "temperature_2": n_t2, "temperature_3": n_t3,
+#                    "pressure_1": n_p1, "pressure_2": n_p2, "ultrasonic": n_us},
+#         "fault_high": {"temperature_1": f_t1, "temperature_2": f_t2, "temperature_3": f_t3,
+#                        "pressure_1": f_p1, "pressure_2": f_p2, "ultrasonic": f_us_high},
+#         "fault_low": {"ultrasonic": f_us_low},
+#     }
+
+
+# def train_one(name, df, n_normal, n_fault):
+#     features = FEATURES_BY_MODEL[name]
+#     print(f"\n--- Training '{name}' ({len(features)} features: {features}) ---")
+#     print(f"    Total samples: {len(df)} ({n_normal} normal + {n_fault} fault)")
+
+#     scaler = StandardScaler()
+#     X = scaler.fit_transform(df[features])
+
+#     # contamination should match the TRUE fault rate in the training data,
+#     # not an arbitrary constant — a fixed 0.05 here systematically dropped
+#     # some fault types when the actual rate ran higher (verified: several
+#     # fault scenarios weren't being flagged as anomalies until this was
+#     # corrected from a flat 0.05 to n_fault/(n_normal+n_fault)).
+#     contamination = n_fault / (n_normal + n_fault)
+#     model = IsolationForest(n_estimators=300, contamination=contamination, random_state=42, n_jobs=-1)
+#     model.fit(X)
+#     anomalies = (model.predict(X) == -1).sum()
+#     print(f"    Contamination: {contamination:.4f} — Anomalies detected: {anomalies}/{len(X)} ({anomalies/len(X)*100:.1f}%)")
+
+#     # Calibrate the score->health mapping to THIS model's actual score
+#     # range, instead of assuming decision_function always lands near
+#     # [-0.5, 0.5] (the old (score+0.5)*100 formula). Verified: with that
+#     # fixed formula, 93.6%/100% of genuinely NORMAL data scored below the
+#     # "normal" severity cutoff (70) — i.e. the dashboard would show
+#     # near-constant false "warning" status. Percentile-based calibration
+#     # (using the 1st/99th percentile of this model's own training scores)
+#     # makes health scores actually span 0-100 meaningfully for THIS model,
+#     # whatever its raw decision_function range happens to be.
+#     all_scores = model.decision_function(X)
+#     score_low  = float(np.percentile(all_scores, 1))
+#     score_high = float(np.percentile(all_scores, 99))
+#     print(f"    Score calibration: raw decision_function range [{all_scores.min():.3f}, {all_scores.max():.3f}], "
+#           f"calibrating [{score_low:.3f}, {score_high:.3f}] -> [0, 100]")
+
+#     def score_to_health(score):
+#         if score_high == score_low:
+#             return 50.0
+#         pct = (score - score_low) / (score_high - score_low)
+#         return round(max(0, min(100, pct * 100)), 1)
+
+#     def predict(values):
+#         sample = pd.DataFrame([values])[features]
+#         X_s = scaler.transform(sample)
+#         score = float(model.decision_function(X_s)[0])
+#         pred = int(model.predict(X_s)[0])
+#         health = score_to_health(score)
+#         return {"health": health, "anomaly": pred == -1,
+#                 "severity": "critical" if health < 40 else "warning" if health < 70 else "normal"}
+
+#     return model, scaler, predict, score_low, score_high
+
+
+# def main():
+#     print("=" * 60)
+#     print("  Factory AI Training — per-station-type models")
+#     print("  (synthetic ranges derived from live thresholds where available)")
+#     print("=" * 60)
+
+#     os.makedirs("model", exist_ok=True)
+
+#     # ── Model 1: vibration_moisture ──────────────────────────────────────────
+#     df1, n1, f1, ranges1 = build_vibration_moisture_dataset()
+#     model1, scaler1, predict1, low1, high1 = train_one("vibration_moisture", df1, n1, f1)
+
+#     # Sanity test values come from the ACTUAL derived normal/fault ranges,
+#     # not arbitrary multipliers — so these stay meaningful even if
+#     # thresholds change, and correctly reflect what the model was trained on.
+#     nr1 = ranges1["normal"]
+#     fh1 = ranges1["fault_high"]
+#     v1n, v2n, m1n, m2n = nr1["vibration_1"][0], nr1["vibration_2"][0], nr1["moisture_1"][0], nr1["moisture_2"][0]
+#     v1f, v2f, m1f, m2f = fh1["vibration_1"][0], fh1["vibration_2"][0], fh1["moisture_1"][0], fh1["moisture_2"][0]
+#     print("    Sanity tests:")
+#     tests1 = [
+#         ("Normal",              {"vibration_1": v1n, "vibration_2": v2n, "moisture_1": m1n, "moisture_2": m2n}),
+#         ("Both vibration high", {"vibration_1": v1f, "vibration_2": v2f, "moisture_1": m1n, "moisture_2": m2n}),
+#         ("One vibration high",  {"vibration_1": v1f, "vibration_2": v2n, "moisture_1": m1n, "moisture_2": m2n}),
+#         ("Both moisture high",  {"vibration_1": v1n, "vibration_2": v2n, "moisture_1": m1f, "moisture_2": m2f}),
+#     ]
+#     for name, values in tests1:
+#         r = predict1(values)
+#         icon = "✅" if (name == "Normal") == (not r["anomaly"]) else "❌"
+#         print(f"      {icon} {name}: health={r['health']} severity={r['severity']}")
+
+#     # ── Model 2: thermal_pressure ────────────────────────────────────────────
+#     df2, n2, f2, ranges2 = build_thermal_pressure_dataset()
+#     model2, scaler2, predict2, low2, high2 = train_one("thermal_pressure", df2, n2, f2)
+
+#     nr2 = ranges2["normal"]
+#     fh2 = ranges2["fault_high"]
+#     fl2 = ranges2["fault_low"]
+#     t1n, t2n, t3n = nr2["temperature_1"][0], nr2["temperature_2"][0], nr2["temperature_3"][0]
+#     p1n, p2n, usn = nr2["pressure_1"][0], nr2["pressure_2"][0], nr2["ultrasonic"][0]
+#     t1f, t2f, t3f = fh2["temperature_1"][0], fh2["temperature_2"][0], fh2["temperature_3"][0]
+#     p1f, p2f      = fh2["pressure_1"][0], fh2["pressure_2"][0]
+#     us_high_f     = fh2["ultrasonic"][0]
+#     us_low_f      = fl2["ultrasonic"][0]
+#     print("    Sanity tests:")
+#     print("    (Note: 'Storage overfull'/'Storage low/empty' below are a single-feature")
+#     print("     deviation (ultrasonic alone) among 6 total features, vs. thermal's 3 and")
+#     print("     pressure's 2 — IsolationForest inherently isolates multi-feature anomalies")
+#     print("     more reliably than single-feature ones. Expect ~50% binary-anomaly detection")
+#     print("     on these two specifically, not the ~100% the others get. The health SCORE")
+#     print("     still drops meaningfully even when the binary flag doesn't trip — that's the")
+#     print("     more useful signal for these two, not the anomaly boolean.)")
+#     tests2 = [
+#         ("Normal",           {"temperature_1": t1n, "temperature_2": t2n, "temperature_3": t3n, "pressure_1": p1n, "pressure_2": p2n, "ultrasonic": usn}),
+#         ("Thermal overload",  {"temperature_1": t1f, "temperature_2": t2f, "temperature_3": t3f, "pressure_1": p1n, "pressure_2": p2n, "ultrasonic": usn}),
+#         ("Pressure spike",    {"temperature_1": t1n, "temperature_2": t2n, "temperature_3": t3n, "pressure_1": p1f, "pressure_2": p2f, "ultrasonic": usn}),
+#         ("Storage overfull",  {"temperature_1": t1n, "temperature_2": t2n, "temperature_3": t3n, "pressure_1": p1n, "pressure_2": p2n, "ultrasonic": us_low_f}),
+#         ("Storage low/empty", {"temperature_1": t1n, "temperature_2": t2n, "temperature_3": t3n, "pressure_1": p1n, "pressure_2": p2n, "ultrasonic": us_high_f}),
+#     ]
+#     for name, values in tests2:
+#         r = predict2(values)
+#         icon = "✅" if (name == "Normal") == (not r["anomaly"]) else "❌"
+#         print(f"      {icon} {name}: health={r['health']} severity={r['severity']}")
+
+#     # ── Save both, package into ONE tar.gz ──────────────────────────────────
+#     print("\nSaving and packaging both models...")
+#     joblib.dump(model1,  "model/isolation_forest_vibration_moisture.joblib")
+#     joblib.dump(scaler1, "model/scaler_vibration_moisture.joblib")
+#     joblib.dump(model2,  "model/isolation_forest_thermal_pressure.joblib")
+#     joblib.dump(scaler2, "model/scaler_thermal_pressure.joblib")
+#     joblib.dump(FEATURES_BY_MODEL, "model/features_by_model.joblib")
+#     joblib.dump(
+#         {"vibration_moisture": (low1, high1), "thermal_pressure": (low2, high2)},
+#         "model/score_calibration.joblib"
+#     )
+
+#     with tarfile.open("model.tar.gz", "w:gz") as tar:
+#         tar.add("model/isolation_forest_vibration_moisture.joblib", arcname="isolation_forest_vibration_moisture.joblib")
+#         tar.add("model/scaler_vibration_moisture.joblib",           arcname="scaler_vibration_moisture.joblib")
+#         tar.add("model/isolation_forest_thermal_pressure.joblib",   arcname="isolation_forest_thermal_pressure.joblib")
+#         tar.add("model/scaler_thermal_pressure.joblib",             arcname="scaler_thermal_pressure.joblib")
+#         tar.add("model/features_by_model.joblib",                   arcname="features_by_model.joblib")
+#         tar.add("model/score_calibration.joblib",                   arcname="score_calibration.joblib")
+
+#     s3 = boto3.client("s3", region_name=AWS_REGION)
+#     try:
+#         s3.upload_file("model.tar.gz", S3_BUCKET, "models/model.tar.gz")
+#         print(f"Uploaded to s3://{S3_BUCKET}/models/model.tar.gz")
+#     except Exception as e:
+#         print(f"S3 upload skipped/failed ({e}) — model.tar.gz and model/*.joblib were still saved locally.")
+
+#     print("\nDone. Copy the model/*.joblib files into your Render repo's model/ folder and push to deploy.")
+
+
+# if __name__ == "__main__":
+#     main()
+
+
 
 """
 train_local.py — per-station-type models
@@ -978,9 +1539,6 @@ def filter_real_normal_rows(df, ranges_by_tag):
 
 # ── Model 1: vibration_moisture (Stations 1 & 3) ────────────────────────────
 def build_vibration_moisture_dataset():
-    n_fault = 120  # split across 4 fault scenarios, 30 each
-    k = n_fault // 4
-
     th = load_representative_thresholds(REP_FACTORY_VM)
 
     # (mean, std, clip_lo, clip_hi) — used only if the live threshold for
@@ -1036,6 +1594,19 @@ def build_vibration_moisture_dataset():
               f"from live thresholds (run fetch_real_data.py first to train on real "
               f"history instead)")
 
+    # Scaled to n_normal, not fixed — a fixed fault count made sense against
+    # a fixed 2000-row synthetic set, but breaks down against real data,
+    # which can run into the hundreds of thousands of rows. A fixed 120
+    # against e.g. 150,000 real rows gives ~0.08% contamination, far below
+    # what this calibration was built and tested around (~5-7%), and
+    # verified to make the model read normal, idle-state readings as
+    # unusually low-scoring even when nothing is wrong. 0.06 reproduces the
+    # original 120/2000 ratio exactly at the old synthetic-only scale, and
+    # scales proportionally at any larger size. min 120 keeps small/edge-case
+    # runs sane; split across 4 fault scenarios, so round to a multiple of 4.
+    n_fault = max(120, round(n_normal * 0.06 / 4) * 4)
+    k = n_fault // 4
+
     FB_FAULT_HIGH = {
         "vibration_1": (9, 1.0, 7, 12), "vibration_2": (9, 1.0, 7, 12),
         "moisture_1":  (25, 2, 22, 30), "moisture_2":  (25, 2, 22, 30),
@@ -1072,17 +1643,27 @@ def build_vibration_moisture_dataset():
     })
 
     df = pd.concat([normal, fault_vib_both, fault_vib_one, fault_moist_both, fault_combined], ignore_index=True)
+    # If real data was used, override each tag's sanity-test mean with the
+    # REAL empirical mean instead of the theoretical threshold midpoint —
+    # otherwise the sanity check tests against a value the real sensor may
+    # rarely or never actually produce, and reports a false alarm on
+    # genuinely correct training (verified: this exact mismatch made every
+    # sanity test here read as "broken" when the model was actually fine).
+    real_used = os.path.exists(real_path)
+    normal_ranges_out = {"vibration_1": n_vib1, "vibration_2": n_vib2, "moisture_1": n_moi1, "moisture_2": n_moi2}
+    if real_used:
+        for tag in normal_ranges_out:
+            old = normal_ranges_out[tag]
+            normal_ranges_out[tag] = (float(normal[tag].mean()), old[1], old[2], old[3])
+
     return df[FEATURES_BY_MODEL["vibration_moisture"]].dropna(), n_normal, n_fault, {
-        "normal": {"vibration_1": n_vib1, "vibration_2": n_vib2, "moisture_1": n_moi1, "moisture_2": n_moi2},
+        "normal": normal_ranges_out,
         "fault_high": {"vibration_1": f_vib1, "vibration_2": f_vib2, "moisture_1": f_moi1, "moisture_2": f_moi2},
     }
 
 
 # ── Model 2: thermal_pressure (Station 2) ───────────────────────────────────
 def build_thermal_pressure_dataset():
-    n_fault  = 150  # split across 5 fault scenarios, 30 each
-    k = n_fault // 5
-
     th = load_representative_thresholds(REP_FACTORY_TP)
 
     FB_NORMAL = {
@@ -1102,19 +1683,24 @@ def build_thermal_pressure_dataset():
         raw = pd.read_csv(real_path)
         normal = filter_real_normal_rows(raw, {
             "temperature_1": n_t1, "temperature_2": n_t2, "temperature_3": n_t3,
-            "pressure_1": n_p1, "pressure_2": n_p2,
-            # ultrasonic deliberately excluded from filtering AND from the
-            # real data itself below — see the note after this block
+            "pressure_2": n_p2,
+            # pressure_1 AND ultrasonic deliberately excluded from filtering
+            # AND from the real data itself below — see the note after this
+            # block. Neither sensor was actually connected during this
+            # collection period, so their columns are placeholder values,
+            # not genuine readings.
         })
-        # ultrasonic wasn't connected yet when this data was collected, so
-        # that column is meaningless — replace it with fresh synthetic
-        # values instead of training on real-looking numbers that don't
-        # actually reflect the sensor. Everything else in this row IS real.
+        # pressure_1 and ultrasonic weren't connected yet when this data was
+        # collected, so those columns are meaningless — replace both with
+        # fresh synthetic values instead of training on numbers that don't
+        # actually reflect either sensor. Everything else in this row IS real.
+        normal["pressure_1"] = gen(*n_p1, len(normal))
         normal["ultrasonic"] = gen(*n_us, len(normal))
         n_normal = len(normal)
         print(f"    Using {n_normal} REAL rows from {real_path} as normal data "
               f"({len(raw) - n_normal} of {len(raw)} excluded as genuine faults; "
-              f"ultrasonic column replaced with synthetic — not connected during collection)")
+              f"pressure_1 and ultrasonic columns replaced with synthetic — "
+              f"not connected during collection)")
     else:
         n_normal = 2000
         # Same idle/operating mix as vibration_moisture — temperature and
@@ -1144,6 +1730,13 @@ def build_thermal_pressure_dataset():
               f"({n_operating} operating + {n_idle} idle/machine-off), ranges derived "
               f"from live thresholds (run fetch_real_data.py first to train on real "
               f"history instead)")
+
+    # Same scaling as vibration_moisture — see the comment there. 0.075
+    # reproduces the original 150/2000 ratio exactly at the old
+    # synthetic-only scale; split across 5 fault scenarios, so round to a
+    # multiple of 5.
+    n_fault = max(150, round(n_normal * 0.075 / 5) * 5)
+    k = n_fault // 5
 
     FB_FAULT_HIGH = {
         "temperature_1": (110, 5, 90, 130), "temperature_2": (110, 5, 90, 130), "temperature_3": (110, 5, 90, 130),
@@ -1196,9 +1789,21 @@ def build_thermal_pressure_dataset():
     df = pd.concat([
         normal, fault_thermal_all, fault_thermal_one, fault_pressure, fault_overfull, fault_lowstorage
     ], ignore_index=True)
+    # Same real-empirical-mean override as vibration_moisture — but only
+    # for the genuinely real columns. pressure_1 and ultrasonic are
+    # synthetic even when real_path exists (see above), so they keep their
+    # theoretical mean; using their real column's mean would just be
+    # testing against disconnected-sensor placeholder data again.
+    real_used = os.path.exists(real_path)
+    normal_ranges_out = {"temperature_1": n_t1, "temperature_2": n_t2, "temperature_3": n_t3,
+                         "pressure_1": n_p1, "pressure_2": n_p2, "ultrasonic": n_us}
+    if real_used:
+        for tag in ("temperature_1", "temperature_2", "temperature_3", "pressure_2"):
+            old = normal_ranges_out[tag]
+            normal_ranges_out[tag] = (float(normal[tag].mean()), old[1], old[2], old[3])
+
     return df[FEATURES_BY_MODEL["thermal_pressure"]].dropna(), n_normal, n_fault, {
-        "normal": {"temperature_1": n_t1, "temperature_2": n_t2, "temperature_3": n_t3,
-                   "pressure_1": n_p1, "pressure_2": n_p2, "ultrasonic": n_us},
+        "normal": normal_ranges_out,
         "fault_high": {"temperature_1": f_t1, "temperature_2": f_t2, "temperature_3": f_t3,
                        "pressure_1": f_p1, "pressure_2": f_p2, "ultrasonic": f_us_high},
         "fault_low": {"ultrasonic": f_us_low},
